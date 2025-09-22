@@ -1,0 +1,104 @@
+#define F_CPU 16000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include "uart_printf.h"
+
+// ---------------- Motor Control ----------------
+void motor_cw(uint8_t pwm_val) {
+	PORTC |=  (1 << PC4);
+	PORTC &= ~(1 << PC5);
+	OCR0A = pwm_val;
+}
+
+void motor_ccw(uint8_t pwm_val) {
+	PORTC &= ~(1 << PC4);
+	PORTC |=  (1 << PC5);
+	OCR0A = pwm_val;
+}
+
+void motor_stop(void) {
+	PORTC &= ~((1 << PC4) | (1 << PC5));
+	OCR0A = 0;
+}
+
+// ---------------- PWM setup ----------------
+void PWM0_init(void) {
+	DDRD |= (1 << PD6);               // PD6 (OC0A) as output
+	DDRC |= (1 << PC4) | (1 << PC5);  // Motor direction pins
+
+	TCCR0A = (1 << WGM01) | (1 << WGM00); // Fast PWM
+	TCCR0A |= (1 << COM0A1);              // Non-inverting mode
+	TCCR0B = (1 << CS01) | (1 << CS00);   // Prescaler = 64
+	OCR0A = 0;
+}
+
+// ---------------- ADC setup ----------------
+void ADC_init(void) {
+	ADMUX = (1 << REFS0);                   // AVcc reference, ADC0
+	ADCSRA = (1 << ADEN) |
+	(1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // prescaler 128
+}
+
+uint16_t get_adc(void) {
+	ADCSRA |= (1 << ADSC);          // Start conversion
+	while (ADCSRA & (1 << ADSC));   // Wait
+	return ADC;                     // Return 10-bit value
+}
+
+// ---------------- UART input ----------------
+uint8_t USART_available(void) {
+	return (UCSR0A & (1 << RXC0));
+}
+
+char USART_receive(void) {
+	return UDR0;
+}
+
+// ---------------- MAIN ----------------
+int main(void) {
+	init_usart_printf(115200);
+	UCSR0B |= (1 << RXEN0) | (1 << TXEN0); // Enable RX and TX
+
+	PWM0_init();
+	ADC_init();
+
+	int16_t ref = 512;
+	float gain = 5.0;
+
+	printf("Motor Control Ready\n");
+	printf("Keys: j=300, k=700, +=gain up, -=gain down\n");
+
+	while (1) {
+		// ---- Check UART input ----
+		if (USART_available()) {
+			char key = USART_receive();
+			if (key == 'j') ref = 300;      // เปลี่ยนเป็น j
+			else if (key == 'k') ref = 700; // เปลี่ยนเป็น k
+			else if (key == '+') gain += 1.0;
+			else if (key == '-') gain -= 1.0;
+		}
+
+		// ---- Read ADC ----
+		uint16_t adc_val = get_adc();
+		int16_t error_raw = ref - adc_val;
+
+		// ---- P control ----
+		float pControl = gain * ((float)error_raw / 1024.0);
+		int16_t motorPWM = (int16_t)(pControl * 255);
+
+		if (motorPWM > 255) motorPWM = 255;
+		if (motorPWM < -255) motorPWM = -255;
+
+		if (motorPWM > 0) motor_ccw(motorPWM);
+		else if (motorPWM < 0) motor_cw(-motorPWM);
+		else motor_stop();
+
+		// ---- Debug info ----
+		printf("ref=%d, adc=%d, error=%d, gain=%.1f\n",
+		ref, adc_val, error_raw, gain);
+
+		_delay_ms(80);
+	}
+}
