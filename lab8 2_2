@@ -1,0 +1,150 @@
+#define F_CPU 16000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdlib.h>
+#include <avr/interrupt.h>
+#include <stdint.h>
+#include "uart_printf.h"
+
+// ――――――――――――――――――――――――――
+// millis ด้วย Timer2 CTC @1ms
+volatile uint32_t msTicks;
+
+ISR(TIMER2_COMPA_vect) {
+    msTicks++;
+}
+
+void init_millis(void) {
+    TCCR2A = (1 << WGM21);       // CTC mode
+    TCCR2B = (1 << CS22);        // prescaler = 64
+    OCR2A  = 250 - 1;            // 16MHz / 64 / 250 = 1kHz
+    TIMSK2 = (1 << OCIE2A);      // Enable compare match interrupt
+}
+
+uint32_t millis(void) {
+    return msTicks;
+}
+
+// ――――――――――――――――――――――――――
+// UART 9600 (ใช้ uart_printf)
+// TX = PD1 (D1), RX = PD0 (D0)
+void init_uart(void) {
+    init_usart_printf(9600);
+    UCSR0B |= (1 << RXEN0) | (1 << TXEN0);  // Enable RX, TX
+}
+
+// ――――――――――――――――――――――――――
+// ADC free-run on ADC0 (PC0, A0)
+void init_adc(void) {
+    ADMUX  = (1 << REFS0);    // AVcc reference, ADC0 channel
+    ADCSRA = (1 << ADEN)  | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0) | (1 << ADATE); // enable, prescaler, auto trigger
+    ADCSRA |= (1 << ADSC);    // Start conversion
+}
+
+uint16_t read_adc(void) {
+    while (!(ADCSRA & (1 << ADIF)));
+    ADCSRA |= (1 << ADIF); // Clear flag
+    return ADC;
+}
+
+// ――――――――――――――――――――――――――
+// PWM Fast-PWM non-invert on OC0A (PD6, D6)
+void init_pwm(void) {
+    DDRD |= (1 << PD6);  // PD6 as output
+    TCCR0A = (1 << WGM00) | (1 << WGM01) | (1 << COM0A1);  // Fast PWM, non-inverting
+    TCCR0B = (1 << CS02);  // Prescaler = 256
+}
+
+void set_pwm(uint8_t d) {
+    OCR0A = d;
+}
+
+// ――――――――――――――――――――――――――
+// Motor direction on PC4/PC5 (A4, A5)
+void motor_cw(void) {
+    PORTC |=  (1 << PC4);
+    PORTC &= ~(1 << PC5);
+}
+
+void motor_ccw(void) {
+    PORTC &= ~(1 << PC4);
+    PORTC |=  (1 << PC5);
+}
+
+void motor_stop(void) {
+    PORTC &= ~((1 << PC4) | (1 << PC5));
+}
+
+// ――――――――――――――――――――――――――
+// Clamp PWM magnitude to 0…255
+uint8_t clamp_pwm(int16_t pwm) {
+    int16_t v = abs(pwm);
+    if (v > 255) v = 255;
+    return (uint8_t)v;
+}
+
+// ――――――――――――――――――――――――――
+// Main function
+int main(void) {
+    // Init
+    init_uart();
+    init_millis();
+    sei();  // Enable global interrupt
+    init_adc();
+    init_pwm();
+
+    DDRC |= (1 << PC4) | (1 << PC5);  // Set motor control pins as output
+    motor_stop();
+
+    // Control vars
+    int16_t ref   = 512;
+    float gain    = 3.0f;
+    const int16_t deadband = 3;
+    uint32_t t_print = 0;
+
+    while (1) {
+        // Manual override via UART
+        if (UCSR0A & (1 << RXC0)) {
+            char c = UDR0;
+            if (c == 'j') {
+                ref = 300;
+                gain = 3.0f;
+            }
+            else if (c == 'k') {
+                ref = 700;
+                gain = 3.0f;
+            }
+        }
+
+        // Read ADC and control
+        uint16_t adc = read_adc();
+        int16_t error = ref - (int16_t)adc;
+
+        // Dead-band
+        if (abs(error) < deadband) {
+            error = 0;
+        }
+
+        float norm   = (float)error / 1024.0f;
+        float pctrl  = gain * norm;
+        int16_t pwmv = (int16_t)(pctrl * 255.0f);
+
+        // Motor direction
+        if (pwmv > 0) {
+            motor_ccw();
+        } else if (pwmv < 0) {
+            motor_cw();
+        } else {
+            motor_stop();
+        }
+
+        // Set PWM
+        set_pwm(clamp_pwm(pwmv));
+
+        // Debug print every 200 ms
+        if (millis() - t_print >= 200) {
+            t_print = millis();
+            printf("ref=%d, error=%d, gain=%.2f\n", (int)ref, (int)error, gain);
+        }
+    }
+}
